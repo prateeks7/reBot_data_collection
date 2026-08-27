@@ -1,0 +1,1447 @@
+diff --git a/src/lerobot/async_inference/configs.py b/src/lerobot/async_inference/configs.py
+index 2e3fe57..2c9d692 100644
+--- a/src/lerobot/async_inference/configs.py
++++ b/src/lerobot/async_inference/configs.py
+@@ -64,6 +64,29 @@ class PolicyServerConfig:
+         default=DEFAULT_OBS_QUEUE_TIMEOUT, metadata={"help": "Timeout for observation queue in seconds"}
+     )
+ 
++    # Startup configuration
++    warmup: bool = field(
++        default=True,
++        metadata={
++            "help": "Run one throwaway inference right after loading a policy, so torch.compile and "
++            "CUDA kernels are ready before the robot starts streaming observations"
++        },
++    )
++    warmup_task: str = field(
++        default="warmup",
++        metadata={
++            "help": "Language instruction used for the warmup inference. Any string works: VLA tokenizers "
++            "here pad to a fixed length, so the compiled shapes do not depend on it"
++        },
++    )
++    reuse_loaded_policy: bool = field(
++        default=True,
++        metadata={
++            "help": "Keep the policy resident across client reconnects. When the next client asks for the "
++            "same checkpoint/device, skip the reload (and its warmup) instead of paying for it again"
++        },
++    )
++
+     def __post_init__(self):
+         """Validate configuration after initialization."""
+         if self.port < 1 or self.port > 65535:
+@@ -96,6 +119,9 @@ class PolicyServerConfig:
+             "fps": self.fps,
+             "environment_dt": self.environment_dt,
+             "inference_latency": self.inference_latency,
++            "warmup": self.warmup,
++            "warmup_task": self.warmup_task,
++            "reuse_loaded_policy": self.reuse_loaded_policy,
+         }
+ 
+ 
+diff --git a/src/lerobot/async_inference/constants.py b/src/lerobot/async_inference/constants.py
+index 56910e6..adf685b 100644
+--- a/src/lerobot/async_inference/constants.py
++++ b/src/lerobot/async_inference/constants.py
+@@ -26,4 +26,15 @@ DEFAULT_OBS_QUEUE_TIMEOUT = 2
+ SUPPORTED_POLICIES = ["act", "smolvla", "diffusion", "tdmpc", "vqbet", "pi0", "pi05", "groot"]
+ 
+ # TODO: Add all other robots
+-SUPPORTED_ROBOTS = ["so100_follower", "so101_follower", "bi_so_follower", "omx_follower"]
++SUPPORTED_ROBOTS = [
++    "so100_follower",
++    "so101_follower",
++    "bi_so_follower",
++    "omx_follower",
++    # Third-party plugin robots (lerobot_robot_seeed_b601). The async client
++    # only needs a Robot that implements get_observation/send_action, which
++    # these do, so the gate at robot_client.async_client() is the only thing
++    # that was keeping them out.
++    "seeed_b601_rs_follower",
++    "seeed_b601_dm_follower",
++]
+diff --git a/src/lerobot/async_inference/policy_server.py b/src/lerobot/async_inference/policy_server.py
+index aedce2a..8cbdbda 100644
+--- a/src/lerobot/async_inference/policy_server.py
++++ b/src/lerobot/async_inference/policy_server.py
+@@ -48,6 +48,7 @@ from lerobot.transport import (
+     services_pb2_grpc,  # type: ignore
+ )
+ from lerobot.transport.utils import receive_bytes_in_chunks
++from lerobot.utils.constants import OBS_IMAGES, OBS_STATE
+ 
+ from .configs import PolicyServerConfig
+ from .constants import SUPPORTED_POLICIES
+@@ -90,6 +91,10 @@ class PolicyServer(services_pb2_grpc.AsyncInferenceServicer):
+         self.preprocessor: PolicyProcessorPipeline[dict[str, Any], dict[str, Any]] | None = None
+         self.postprocessor: PolicyProcessorPipeline[PolicyAction, PolicyAction] | None = None
+ 
++        # Identifies what is currently resident on the GPU, so a reconnecting client asking for the
++        # same thing does not pay the load + compile cost again. See SendPolicyInstructions.
++        self._loaded_policy_key: tuple | None = None
++
+     @property
+     def running(self):
+         return not self.shutdown_event.is_set()
+@@ -148,6 +153,23 @@ class PolicyServer(services_pb2_grpc.AsyncInferenceServicer):
+         self.lerobot_features = policy_specs.lerobot_features
+         self.actions_per_chunk = policy_specs.actions_per_chunk
+ 
++        # A big VLA costs minutes to load and (with compile_model) to compile, and neither result
++        # depends on the client. Keep it resident so only the first client of a server's lifetime
++        # waits: reconnect, restart the client, change the task -- all warm after that.
++        policy_key = (
++            policy_specs.policy_type,
++            policy_specs.pretrained_name_or_path,
++            policy_specs.device,
++            tuple(sorted(policy_specs.rename_map.items())),
++        )
++        already_loaded = self.policy is not None and policy_key == self._loaded_policy_key
++        if self.config.reuse_loaded_policy and already_loaded:
++            self.logger.info(
++                f"Policy {policy_specs.pretrained_name_or_path} is already loaded on {self.device} -- "
++                "reusing it (no reload, no warmup)"
++            )
++            return services_pb2.Empty()
++
+         policy_class = get_policy_class(self.policy_type)
+ 
+         start = time.perf_counter()
+@@ -167,11 +189,60 @@ class PolicyServer(services_pb2_grpc.AsyncInferenceServicer):
+         )
+ 
+         end = time.perf_counter()
++        self._loaded_policy_key = policy_key
+ 
+         self.logger.info(f"Time taken to put policy on {self.device}: {end - start:.4f} seconds")
+ 
++        if self.config.warmup:
++            self._warmup_policy()
++
+         return services_pb2.Empty()
+ 
++    def _warmup_policy(self) -> None:
++        """Run one throwaway inference on zero-filled inputs.
++
++        torch.compile is lazy: with compile_model=True the graph is only built on the first real call,
++        which would otherwise happen with the robot already streaming -- the arm sits there while
++        Inductor autotunes. Doing it here moves that cost into server startup, where the client is
++        still blocked on SendPolicyInstructions and nothing is moving.
++
++        The dummy inputs mirror exactly what raw_observation_to_observation() produces at runtime --
++        same keys, same shapes, same dtype -- otherwise the compiled graph would be keyed on shapes
++        the real observations never hit and would simply be recompiled. In particular only the
++        cameras the client actually has are passed: padding features like empty_camera_N are
++        synthesised inside the policy, so adding them here would change the graph.
++        """
++        image_keys = [
++            key
++            for key in self.lerobot_features
++            if key.startswith(OBS_IMAGES) and key in self.policy_image_features
++        ]
++        state_feature = self.policy.config.input_features.get(OBS_STATE)
++        if state_feature is None:
++            self.logger.warning("Skipping warmup: policy has no observation.state input feature")
++            return
++
++        observation: dict[str, Any] = {
++            key: torch.zeros(1, *self.policy_image_features[key].shape, dtype=torch.float32)
++            for key in image_keys
++        }
++        observation[OBS_STATE] = torch.zeros(1, *state_feature.shape, dtype=torch.float32)
++        observation["task"] = self.config.warmup_task
++
++        self.logger.info(
++            f"Warming up the policy ({len(image_keys)} camera(s), task='{self.config.warmup_task}'). "
++            "With torch.compile in max-autotune this can take several minutes on a cold cache."
++        )
++        start = time.perf_counter()
++        try:
++            action_tensor = self._get_action_chunk(self.preprocessor(observation))
++            self.postprocessor(action_tensor[:, 0, :])
++        except Exception as e:  # noqa: BLE001 - a failed warmup must not stop the server from serving
++            self.logger.warning(f"Warmup inference failed ({e}); the first observation will pay the cost")
++            return
++
++        self.logger.info(f"Warmup complete in {time.perf_counter() - start:.1f}s -- policy is hot")
++
+     def SendObservations(self, request_iterator, context):  # noqa: N802
+         """Receive observations from the robot client"""
+         client_id = context.peer()
+diff --git a/src/lerobot/async_inference/robot_client.py b/src/lerobot/async_inference/robot_client.py
+index da40f85..497841f 100644
+--- a/src/lerobot/async_inference/robot_client.py
++++ b/src/lerobot/async_inference/robot_client.py
+@@ -74,6 +74,8 @@ from lerobot.transport import (
+     services_pb2_grpc,  # type: ignore
+ )
+ from lerobot.transport.utils import grpc_channel_options, send_bytes_in_chunks
++from lerobot.utils.robot_utils import return_robot_to_home
++from lerobot.utils.import_utils import register_third_party_plugins
+ 
+ from .configs import RobotClientConfig
+ from .constants import SUPPORTED_ROBOTS
+@@ -173,6 +175,12 @@ class RobotClient:
+ 
+             self.stub.SendPolicyInstructions(policy_setup)
+ 
++            # Park the follower at home before any observation is streamed. The
++            # policy was trained on episodes that all start at home, so starting
++            # anywhere else is off-distribution from the very first observation.
++            # Done after the handshake so a failed connection never moves the arm.
++            return_robot_to_home(self.robot, self.config.fps)
++
+             self.shutdown_event.clear()
+ 
+             return True
+@@ -522,5 +530,13 @@ def async_client(cfg: RobotClientConfig):
+             client.logger.info("Client stopped")
+ 
+ 
++def main():
++    # Third-party robots (e.g. lerobot_robot_seeed_b601) register their config
++    # subclass on import, so this has to run before draccus parses --robot.type
++    # or the type is unknown. Same ordering lerobot_record.main() uses.
++    register_third_party_plugins()
++    async_client()
++
++
+ if __name__ == "__main__":
+-    async_client()  # run the client
++    main()  # run the client
+diff --git a/src/lerobot/cameras/opencv/camera_opencv.py b/src/lerobot/cameras/opencv/camera_opencv.py
+index d581e14..51c1296 100644
+--- a/src/lerobot/cameras/opencv/camera_opencv.py
++++ b/src/lerobot/cameras/opencv/camera_opencv.py
+@@ -234,9 +234,16 @@ class OpenCVCamera(Camera):
+ 
+         success = self.videocapture.set(cv2.CAP_PROP_FPS, float(self.fps))
+         actual_fps = self.videocapture.get(cv2.CAP_PROP_FPS)
+-        # Use math.isclose for robust float comparison
+-        if not success or not math.isclose(self.fps, actual_fps, rel_tol=1e-3):
++        if actual_fps + 1e-3 < self.fps:
+             raise RuntimeError(f"{self} failed to set fps={self.fps} ({actual_fps=}).")
++        if not success or not math.isclose(self.fps, actual_fps, rel_tol=1e-3):
++            logging.warning(
++                "%s requested fps=%s, but the camera is running at actual_fps=%s; "
++                "continuing because the camera rate is at least the requested rate.",
++                self,
++                self.fps,
++                actual_fps,
++            )
+ 
+     def _validate_fourcc(self) -> None:
+         """Validates and sets the camera's FOURCC code."""
+@@ -272,16 +279,26 @@ class OpenCVCamera(Camera):
+         height_success = self.videocapture.set(cv2.CAP_PROP_FRAME_HEIGHT, float(self.capture_height))
+ 
+         actual_width = int(round(self.videocapture.get(cv2.CAP_PROP_FRAME_WIDTH)))
+-        if not width_success or self.capture_width != actual_width:
++        if self.capture_width != actual_width:
+             raise RuntimeError(
+                 f"{self} failed to set capture_width={self.capture_width} ({actual_width=}, {width_success=})."
+             )
++        if not width_success:
++            logger.warning(
++                f"{self} reported failure setting capture_width={self.capture_width}, "
++                f"but actual_width={actual_width}; continuing."
++            )
+ 
+         actual_height = int(round(self.videocapture.get(cv2.CAP_PROP_FRAME_HEIGHT)))
+-        if not height_success or self.capture_height != actual_height:
++        if self.capture_height != actual_height:
+             raise RuntimeError(
+                 f"{self} failed to set capture_height={self.capture_height} ({actual_height=}, {height_success=})."
+             )
++        if not height_success:
++            logger.warning(
++                f"{self} reported failure setting capture_height={self.capture_height}, "
++                f"but actual_height={actual_height}; continuing."
++            )
+ 
+     @staticmethod
+     def find_cameras() -> list[dict[str, Any]]:
+diff --git a/src/lerobot/cameras/opencv/configuration_opencv.py b/src/lerobot/cameras/opencv/configuration_opencv.py
+index 37a4286..180538f 100644
+--- a/src/lerobot/cameras/opencv/configuration_opencv.py
++++ b/src/lerobot/cameras/opencv/configuration_opencv.py
+@@ -62,6 +62,7 @@ class OpenCVCameraConfig(CameraConfig):
+     rotation: Cv2Rotation = Cv2Rotation.NO_ROTATION
+     warmup_s: int = 1
+     fourcc: str | None = None
++    copy: bool | int | str = False
+ 
+     def __post_init__(self) -> None:
+         if self.color_mode not in (ColorMode.RGB, ColorMode.BGR):
+diff --git a/src/lerobot/cameras/orbbec/camera_orbbec.py b/src/lerobot/cameras/orbbec/camera_orbbec.py
+index d5f85fe..8c3b141 100644
+--- a/src/lerobot/cameras/orbbec/camera_orbbec.py
++++ b/src/lerobot/cameras/orbbec/camera_orbbec.py
+@@ -504,6 +504,26 @@ class OrbbecPipeline:
+             )
+             self.config.enable_stream(color_profile)
+ 
++        # Depth and colour sit on different sensors with different intrinsics, so
++        # raw depth pixels do not line up with colour pixels. Ask the SDK to warp
++        # depth into the colour frame whenever both streams are on, so depth[y, x]
++        # and colour[y, x] describe the same point.
++        self.depth_aligned_to_color = False
++        if self.enable_color and self.enable_depth:
++            for mode_name in ("HW_MODE", "SW_MODE"):
++                try:
++                    self.config.set_align_mode(getattr(ob.OBAlignMode, mode_name))
++                    self.depth_aligned_to_color = True
++                    logger.info("Enabled Orbbec depth-to-colour alignment (%s)", mode_name)
++                    break
++                except Exception as e:  # noqa: BLE001 - try the next mode, then give up
++                    logger.debug("Orbbec align mode %s unavailable: %s", mode_name, e)
++            if not self.depth_aligned_to_color:
++                logger.warning(
++                    "Orbbec depth-to-colour alignment is unavailable; recorded depth will be in "
++                    "the depth sensor's own frame and will not line up with the colour image."
++                )
++
+         # 启动 SDK pipeline（阻塞/异常可能来自 SDK，自行处理）
+         self.pipeline.start(self.config)
+         self.started = True
+@@ -925,6 +945,43 @@ class OrbbecDepthCamera(OrbbecBaseCamera):
+         self.warmup_s = config.warmup_s
+         self._last_missing_depth_log_ts: float = 0.0
+         self.depth_alpha = float(config.depth_alpha)
++        # Raw uint16 depth for the frame the last read()/async_read() returned.
++        self._returned_raw_depth: Optional[np.ndarray] = None
++
++    def take_raw_depth(self) -> Optional[np.ndarray]:
++        """Raw uint16 depth belonging to the frame the last read returned.
++
++        Multiply by `depth_scale_m` from the calibration for metres; 0 means
++        "no return".
++        """
++        return self._returned_raw_depth
++
++    def get_calibration(self) -> dict:
++        """Depth scale and intrinsics needed to unproject recorded depth frames."""
++        info: dict = {
++            "serial_number": self.serial_number,
++            "device_name": self.device_name,
++            "depth_scale_m": 0.001,  # Orbbec Y16 depth is in millimetres
++            "depth_aligned_to_color": bool(getattr(self.pipeline, "depth_aligned_to_color", False)),
++        }
++        try:
++            param = self.pipeline.pipeline.get_camera_param()
++            for label, source in (("color_intrinsics", param.rgb_intrinsic), ("depth_intrinsics", param.depth_intrinsic)):
++                info[label] = {
++                    "width": int(source.width),
++                    "height": int(source.height),
++                    "fx": float(source.fx),
++                    "fy": float(source.fy),
++                    "cx": float(source.cx),
++                    "cy": float(source.cy),
++                }
++            # After alignment the depth image lives in the colour frame.
++            info["intrinsics"] = (
++                info["color_intrinsics"] if info["depth_aligned_to_color"] else info["depth_intrinsics"]
++            )
++        except Exception as e:  # noqa: BLE001 - metadata must never break recording
++            logger.warning("Could not read Orbbec camera parameters: %s", e)
++        return info
+ 
+     def read(self, color_mode: "ColorMode" | None = None) -> Optional[np.ndarray]:
+         """
+@@ -974,6 +1031,10 @@ class OrbbecDepthCamera(OrbbecBaseCamera):
+                 logger.warning(f"Failed to decode Orbbec depth buffer into HxW uint16 array: {e}")
+                 return None
+ 
++        # Keep the undegraded uint16 depth for the sidecar recorder. `depth_u16` is
++        # a read-only view onto the SDK buffer, so copy before handing it out.
++        self._returned_raw_depth = np.ascontiguousarray(depth_u16, dtype=np.uint16).copy()
++
+         mask_valid = depth_u16 > 0
+         depth_8u = cv2.convertScaleAbs(depth_u16, alpha=self.depth_alpha)
+         img = cv2.applyColorMap(depth_8u, cv2.COLORMAP_JET)
+diff --git a/src/lerobot/cameras/realsense/camera_realsense.py b/src/lerobot/cameras/realsense/camera_realsense.py
+index a7d0b78..1206910 100644
+--- a/src/lerobot/cameras/realsense/camera_realsense.py
++++ b/src/lerobot/cameras/realsense/camera_realsense.py
+@@ -279,7 +279,13 @@ def _decode_color_frame_to_rgb(color_frame: Any) -> NDArray[Any]:
+     color_raw = np.asanyarray(color_frame.get_data())
+ 
+     if frame_format == rs_module.format.rgb8:
+-        return np.ascontiguousarray(color_raw)
++        # `color_raw` is a zero-copy view onto librealsense's frame buffer, and
++        # np.ascontiguousarray() is a no-op on it. Returning it would (a) pin the
++        # underlying frame for as long as any caller keeps the array, which
++        # exhausts the 16-deep frame queue and stalls the stream, and (b) let
++        # librealsense recycle the buffer mid-read and tear the image. The bgr8
++        # and yuyv paths below are safe because cvtColor allocates. Copy here.
++        return color_raw.copy()
+ 
+     if frame_format == rs_module.format.bgr8:
+         return np.ascontiguousarray(cv2.cvtColor(color_raw, cv2.COLOR_BGR2RGB))
+@@ -376,6 +382,7 @@ class SharedRealSenseManager:
+         self.profile: Any = None
+         self.current_spec: _PipelineSpec | None = None
+         self.depth_scale = 0.001
++        self.align: Any = None
+ 
+         self.frame_lock = Lock()
+         self.frame_condition = Condition(self.frame_lock)
+@@ -616,6 +623,14 @@ class SharedRealSenseManager:
+         self.current_spec = actual_spec
+         self.depth_scale = self._extract_depth_scale(profile)
+ 
++        # Depth and colour are different sensors with different intrinsics, so raw
++        # depth pixels do not correspond to colour pixels. Warp depth into the
++        # colour frame whenever both streams are live, so depth[y, x] describes
++        # the same point as colour[y, x] and the pair can be unprojected directly.
++        self.align = None
++        if actual_spec.color.enabled and actual_spec.depth.enabled:
++            self.align = rs_module.align(rs_module.stream.color)
++
+         with self.frame_condition:
+             self.latest_snapshot = None
+             self.frames_seq = 0
+@@ -683,14 +698,76 @@ class SharedRealSenseManager:
+ 
+         return _PipelineSpec(color=color_spec, depth=depth_spec)
+ 
++    def get_calibration(self) -> dict[str, Any]:
++        """Everything needed to unproject a recorded depth frame into metres.
++
++        When `depth_aligned_to_color` is true the depth frames carry the colour
++        intrinsics, so `intrinsics` below is the one to use for both streams.
++        """
++        rs_module = _require_realsense()
++
++        def _intrinsics(stream: Any) -> dict[str, Any] | None:
++            try:
++                video_profile = self.profile.get_stream(stream).as_video_stream_profile()
++            except Exception:  # noqa: BLE001 - stream simply not enabled
++                return None
++            intrinsics = video_profile.get_intrinsics()
++            return {
++                "width": int(intrinsics.width),
++                "height": int(intrinsics.height),
++                "fx": float(intrinsics.fx),
++                "fy": float(intrinsics.fy),
++                "cx": float(intrinsics.ppx),
++                "cy": float(intrinsics.ppy),
++                "distortion_model": str(intrinsics.model).split(".")[-1],
++                "distortion_coeffs": [float(c) for c in intrinsics.coeffs],
++            }
++
++        with self._lock:
++            if self.profile is None:
++                return {}
++            aligned = self.align is not None
++            color_intrinsics = _intrinsics(rs_module.stream.color)
++            depth_intrinsics = _intrinsics(rs_module.stream.depth)
++
++        return {
++            "serial_number": self.serial_number,
++            "device_name": self.device_name,
++            "model": self.model_traits.model_name,
++            "depth_scale_m": float(self.depth_scale),
++            "depth_aligned_to_color": aligned,
++            # After alignment the depth image lives in the colour frame.
++            "intrinsics": (color_intrinsics if aligned else depth_intrinsics),
++            "color_intrinsics": color_intrinsics,
++            "depth_intrinsics": depth_intrinsics,
++        }
++
+     def _extract_depth_scale(self, profile: Any) -> float:
++        # query_sensors() hands back generic `sensor` objects: get_depth_scale is
++        # only reachable through as_depth_sensor(), so a hasattr() probe silently
++        # misses it and falls back to 1 mm. That is wrong by 10x on a D405 (which
++        # reports 0.1 mm) and would scale every derived point cloud incorrectly.
+         try:
+             device = profile.get_device()
+-            for sensor in device.query_sensors():
+-                if hasattr(sensor, "get_depth_scale"):
+-                    return float(sensor.get_depth_scale())
+-        except Exception:
++            depth_sensor = device.first_depth_sensor()
++            if depth_sensor:
++                return float(depth_sensor.get_depth_scale())
++        except Exception:  # noqa: BLE001 - fall through to the per-sensor probe
+             pass
++
++        try:
++            for sensor in profile.get_device().query_sensors():
++                as_depth = sensor.as_depth_sensor()
++                if as_depth:
++                    return float(as_depth.get_depth_scale())
++        except Exception:  # noqa: BLE001 - last resort below
++            pass
++
++        logger.warning(
++            "Could not read the depth scale for %s; assuming 1 mm per unit. Recorded depth "
++            "may be scaled incorrectly.",
++            self.serial_number,
++        )
+         return 0.001
+ 
+     def _read_loop(self) -> None:
+@@ -748,12 +825,23 @@ class SharedRealSenseManager:
+         color = None
+         depth = None
+ 
++        if self.align is not None:
++            try:
++                frames = self.align.process(frames)
++            except Exception as e:  # noqa: BLE001 - fall back to unaligned rather than dropping the frame
++                logger.warning(
++                    "RealSense %s depth-to-colour alignment failed for %s: %s",
++                    self.model_traits.model_name,
++                    self.serial_number,
++                    e,
++                )
++
+         color_frame = frames.get_color_frame()
+-        if color_frame is not None:
++        if color_frame:
+             color = np.ascontiguousarray(_decode_color_frame_to_rgb(color_frame))
+ 
+         depth_frame = frames.get_depth_frame()
+-        if depth_frame is not None:
++        if depth_frame:
+             depth = np.ascontiguousarray(np.asanyarray(depth_frame.get_data()).copy())
+ 
+         return _FrameSnapshot(color=color, depth=depth)
+@@ -782,6 +870,7 @@ class SharedRealSenseManager:
+         self.profile = None
+         self.current_spec = None
+         self.depth_scale = 0.001
++        self.align = None
+ 
+         with self.frame_condition:
+             self.latest_snapshot = None
+@@ -814,6 +903,10 @@ class SharedRealSenseBaseCamera(Camera):
+         self.stop_event: Event | None = None
+         self.frame_lock = Lock()
+         self.latest_frame: NDArray[Any] | None = None
++        # Raw uint16 depth for the frame in `latest_frame`, kept in lockstep with
++        # it so a recorder can pair metric depth with the exact frame it received.
++        self.latest_raw_depth: NDArray[Any] | None = None
++        self._returned_raw_depth: NDArray[Any] | None = None
+         self.new_frame_event = Event()
+         self._last_frame_ts: float | None = None
+         self._last_pipeline_seq = -1
+@@ -951,11 +1044,20 @@ class SharedRealSenseBaseCamera(Camera):
+         if frame is None:
+             return None
+ 
++        raw_depth = snapshot.depth if self.KIND == "depth" else None
+         with self.frame_lock:
+             self.latest_frame = frame
++            self.latest_raw_depth = raw_depth
+         self._last_frame_ts = time.time()
+         return frame
+ 
++    def take_raw_depth(self) -> NDArray[Any] | None:
++        """Raw uint16 depth belonging to the frame the last `async_read` returned.
++
++        Multiply by the manager's `depth_scale_m` for metres; 0 means "no return".
++        """
++        return self._returned_raw_depth
++
+     def _read_loop(self) -> None:
+         if self.manager is None:
+             raise RuntimeError(f"{self}: manager must be initialized before starting the read loop.")
+@@ -1015,6 +1117,7 @@ class SharedRealSenseBaseCamera(Camera):
+ 
+         with self.frame_lock:
+             frame = self.latest_frame
++            self._returned_raw_depth = self.latest_raw_depth
+             self.new_frame_event.clear()
+ 
+         if frame is None:
+diff --git a/src/lerobot/datasets/lerobot_dataset.py b/src/lerobot/datasets/lerobot_dataset.py
+index 36bffa1..036c532 100644
+--- a/src/lerobot/datasets/lerobot_dataset.py
++++ b/src/lerobot/datasets/lerobot_dataset.py
+@@ -1522,7 +1522,12 @@ class LeRobotDataset(torch.utils.data.Dataset):
+             episode_index = self.episode_buffer["episode_index"]
+             if isinstance(episode_index, np.ndarray):
+                 episode_index = episode_index.item() if episode_index.size == 1 else episode_index[0]
+-            for cam_key in self.meta.image_keys:
++            # `add_frame` stages PNGs for "image" AND "video" features alike, so
++            # discarding has to sweep both. Iterating `image_keys` alone left the
++            # staged frames of every discarded take on disk in a video-only
++            # dataset (where `image_keys` is empty), to be picked up by the
++            # encoder when the same episode index was recorded again.
++            for cam_key in self.meta.camera_keys:
+                 img_dir = self._get_image_file_dir(episode_index, cam_key)
+                 if img_dir.is_dir():
+                     shutil.rmtree(img_dir)
+diff --git a/src/lerobot/datasets/video_utils.py b/src/lerobot/datasets/video_utils.py
+index 84ce137..79f1a70 100644
+--- a/src/lerobot/datasets/video_utils.py
++++ b/src/lerobot/datasets/video_utils.py
+@@ -453,9 +453,14 @@ def concatenate_video_files(
+     stream_map = {}
+     for input_stream in input_container.streams:
+         if input_stream.type in ("video", "audio", "subtitle"):  # only copy compatible streams
+-            stream_map[input_stream.index] = output_container.add_stream_from_template(
+-                template=input_stream, opaque=True
+-            )
++            if hasattr(output_container, "add_stream_from_template"):
++                stream_map[input_stream.index] = output_container.add_stream_from_template(
++                    template=input_stream, opaque=True
++                )
++            else:
++                # PyAV < 13 has no `add_stream_from_template`; `add_stream(template=...)` is the
++                # equivalent stream-copy path there.
++                stream_map[input_stream.index] = output_container.add_stream(template=input_stream)
+ 
+             # set the time base to the input stream time base (missing in the codec context)
+             stream_map[input_stream.index].time_base = input_stream.time_base
+@@ -527,7 +532,9 @@ def get_audio_info(video_path: Path | str) -> dict:
+             return {"has_audio": False}
+ 
+         audio_info["audio.channels"] = audio_stream.channels
+-        audio_info["audio.codec"] = audio_stream.codec.canonical_name
++        audio_info["audio.codec"] = getattr(
++            audio_stream.codec, "canonical_name", audio_stream.codec.name
++        )
+         # In an ideal loseless case : bit depth x sample rate x channels = bit rate.
+         # In an actual compressed case, the bit rate is set according to the compression level : the lower the bit rate, the more compression is applied.
+         audio_info["audio.bit_rate"] = audio_stream.bit_rate
+@@ -560,7 +567,9 @@ def get_video_info(video_path: Path | str) -> dict:
+ 
+         video_info["video.height"] = video_stream.height
+         video_info["video.width"] = video_stream.width
+-        video_info["video.codec"] = video_stream.codec.canonical_name
++        video_info["video.codec"] = getattr(
++            video_stream.codec, "canonical_name", video_stream.codec.name
++        )
+         video_info["video.pix_fmt"] = video_stream.pix_fmt
+         video_info["video.is_depth_map"] = False
+ 
+diff --git a/src/lerobot/policies/pi05/configuration_pi05.py b/src/lerobot/policies/pi05/configuration_pi05.py
+index b96e6d1..68744b4 100644
+--- a/src/lerobot/policies/pi05/configuration_pi05.py
++++ b/src/lerobot/policies/pi05/configuration_pi05.py
+@@ -53,6 +53,23 @@ class PI05Config(PreTrainedConfig):
+     # Real-Time Chunking (RTC) configuration
+     rtc_config: RTCConfig | None = None
+ 
++    # HF Hub revision the checkpoint was pulled from. Set by from_pretrained();
++    # a field here only because newer checkpoints serialise it into config.json.
++    pretrained_revision: str | None = None
++
++    # Train/predict actions as deltas from the current joint position rather
++    # than absolute targets. NOT implemented by this fork's modeling code --
++    # only the False (absolute-action) path has ever been exercised here.
++    # __post_init__ below refuses to load a checkpoint that sets this True,
++    # since silently treating a relative-action checkpoint as absolute would
++    # send the wrong positions to the arm without any error.
++    use_relative_actions: bool = False
++    relative_exclude_joints: list[str] = field(default_factory=list)
++
++    # Ordered joint names the action vector's dims correspond to. Informational
++    # provenance from training; this fork's modeling code doesn't consume it.
++    action_feature_names: list[str] = field(default_factory=list)
++
+     image_resolution: tuple[int, int] = (
+         DEFAULT_IMAGE_SIZE,
+         DEFAULT_IMAGE_SIZE,
+@@ -115,6 +132,13 @@ class PI05Config(PreTrainedConfig):
+         if self.dtype not in ["bfloat16", "float32"]:
+             raise ValueError(f"Invalid dtype: {self.dtype}")
+ 
++        if self.use_relative_actions:
++            raise NotImplementedError(
++                "This checkpoint was trained with use_relative_actions=True, but this fork's "
++                "PI05 modeling code only implements absolute-position actions. Loading it anyway "
++                "would silently send the wrong joint targets to the robot."
++            )
++
+     def validate_features(self) -> None:
+         """Validate and set up input/output features."""
+         for i in range(self.empty_cameras):
+diff --git a/src/lerobot/processor/__init__.py b/src/lerobot/processor/__init__.py
+index 164f7da..f8bb98e 100644
+--- a/src/lerobot/processor/__init__.py
++++ b/src/lerobot/processor/__init__.py
+@@ -73,6 +73,7 @@ from .policy_robot_bridge import (
+     PolicyActionToRobotActionProcessorStep,
+     RobotActionToPolicyActionProcessorStep,
+ )
++from .relative_action_processor import AbsoluteActionsProcessorStep, RelativeActionsProcessorStep
+ from .rename_processor import RenameObservationsProcessorStep
+ from .tokenizer_processor import ActionTokenizerProcessorStep, TokenizerProcessorStep
+ 
+@@ -111,6 +112,8 @@ __all__ = [
+     "RobotAction",
+     "RobotActionProcessorStep",
+     "RobotObservation",
++    "RelativeActionsProcessorStep",
++    "AbsoluteActionsProcessorStep",
+     "RenameObservationsProcessorStep",
+     "RewardClassifierProcessorStep",
+     "RewardProcessorStep",
+diff --git a/src/lerobot/scripts/lerobot_record.py b/src/lerobot/scripts/lerobot_record.py
+index 8b6f0ae..509c4d6 100644
+--- a/src/lerobot/scripts/lerobot_record.py
++++ b/src/lerobot/scripts/lerobot_record.py
+@@ -63,6 +63,9 @@ lerobot-record \
+ """
+ 
+ import logging
++import math
++import signal
++import sys
+ import time
+ from dataclasses import asdict, dataclass, field
+ from pathlib import Path
+@@ -89,6 +92,7 @@ from lerobot.cameras.realsense.configuration_rs_d435i import (  # noqa: F401
+ from lerobot.cameras.zmq.configuration_zmq import ZMQCameraConfig  # noqa: F401
+ from lerobot.configs import parser
+ from lerobot.configs.policies import PreTrainedConfig
++from lerobot.datasets.depth_recorder import DepthRecorder
+ from lerobot.datasets.image_writer import safe_stop_image_writer
+ from lerobot.datasets.lerobot_dataset import LeRobotDataset
+ from lerobot.datasets.pipeline_features import aggregate_pipeline_dataset_features, create_initial_features
+@@ -145,7 +149,12 @@ from lerobot.utils.control_utils import (
+     sanity_check_dataset_robot_compatibility,
+ )
+ from lerobot.utils.import_utils import register_third_party_plugins
+-from lerobot.utils.robot_utils import precise_sleep
++from lerobot.utils.robot_utils import (
++    _read_robot_action_pose,
++    precise_sleep,
++    ramp_robot_to_action,  # noqa: F401 - re-exported for inference scripts
++    return_robot_to_home,
++)
+ from lerobot.utils.utils import (
+     get_safe_torch_device,
+     init_logging,
+@@ -164,10 +173,17 @@ class DatasetRecordConfig:
+     root: str | Path | None = None
+     # Limit the frames per second.
+     fps: int = 30
+-    # Number of seconds for data recording for each episode.
++    # Number of seconds for data recording for each episode. Set to 0 to end episodes manually.
+     episode_time_s: int | float = 60
+     # Number of seconds for resetting the environment after each episode.
+     reset_time_s: int | float = 60
++    # Number of seconds to reset after a discarded (re-recorded) episode. The
++    # follower is homed first, same as after a saved episode.
++    discard_reset_time_s: int | float = 5
++    # Seconds at the start of each episode spent ramping the follower from home
++    # onto the leader's live pose. Recorded as part of the episode, so frame 0 is
++    # always the same home pose. Set to 0 to hand over to the leader instantly.
++    engage_ramp_s: float = 1.0
+     # Number of episodes to record.
+     num_episodes: int = 50
+     # Encode frames in the dataset into video
+@@ -221,6 +237,11 @@ class RecordConfig:
+     play_sounds: bool = True
+     # Resume recording on an existing dataset.
+     resume: bool = False
++    # Optional: hold after the reset window until every leader joint is within
++    # this many degrees of home. Off by default — `dataset.engage_ramp_s` makes
++    # the episode start at home regardless of where the leader is, so the leader
++    # does not need to be aligned by hand.
++    leader_home_tolerance_deg: float = 0.0
+ 
+     def __post_init__(self):
+         # HACK: We parse again the cli args here to get the pretrained path if there was one.
+@@ -294,6 +315,10 @@ def record_loop(
+     single_task: str | None = None,
+     display_data: bool = False,
+     display_compressed_images: bool = False,
++    status_label: str | None = None,
++    depth_recorder: DepthRecorder | None = None,
++    display_skip_keys: tuple[str, ...] = (),
++    engage_ramp_s: float = 0.0,
+ ):
+     if dataset is not None and dataset.fps != fps:
+         raise ValueError(f"The dataset fps should be equal to requested fps ({dataset.fps} != {fps}).")
+@@ -331,9 +356,26 @@ def record_loop(
+ 
+     timestamp = 0
+     start_episode_t = time.perf_counter()
+-    while timestamp < control_time_s:
++    manual_end = control_time_s is None or control_time_s <= 0
++    show_status = status_label is not None and sys.stdout.isatty()
++    last_status_t = -1.0
++    logged_no_action_source = False
++    # Lead-in that closes the gap between the parked follower and wherever the
++    # leader is. It runs *inside* the episode, so every episode's frame 0 is the
++    # same home pose and the catch-up motion is part of the recorded demo.
++    ramp_start_action: dict[str, float] | None = None
++    while manual_end or timestamp < control_time_s:
+         start_loop_t = time.perf_counter()
+ 
++        if show_status and timestamp - last_status_t >= 0.1:
++            last_status_t = timestamp
++            clock = (
++                f"{timestamp:6.1f}s elapsed"
++                if manual_end
++                else f"{max(control_time_s - timestamp, 0.0):6.1f}s left"
++            )
++            print(f"\r  {status_label}  {clock}   ", end="", flush=True)
++
+         if events["exit_early"]:
+             events["exit_early"] = False
+             break
+@@ -368,6 +410,18 @@ def record_loop(
+             # Applies a pipeline to the raw teleop action, default is IdentityProcessor
+             act_processed_teleop = teleop_action_processor((act, obs))
+ 
++            if engage_ramp_s > 0 and timestamp < engage_ramp_s:
++                if ramp_start_action is None:
++                    ramp_start_action = _read_robot_action_pose(robot) or dict(act_processed_teleop)
++                alpha = timestamp / engage_ramp_s
++                # Blend, and keep the blended value as the action so what is
++                # recorded stays the action that was actually sent.
++                act_processed_teleop = {
++                    key: ramp_start_action.get(key, value)
++                    + (value - ramp_start_action.get(key, value)) * alpha
++                    for key, value in act_processed_teleop.items()
++                }
++
+         elif policy is None and isinstance(teleop, list):
+             arm_action = teleop_arm.get_action()
+             arm_action = {f"arm_{k}": v for k, v in arm_action.items()}
+@@ -376,11 +430,27 @@ def record_loop(
+             act = {**arm_action, **base_action} if len(base_action) > 0 else arm_action
+             act_processed_teleop = teleop_action_processor((act, obs))
+         else:
+-            logging.info(
+-                "No policy or teleoperator provided, skipping action generation."
+-                "This is likely to happen when resetting the environment without a teleop device."
+-                "The robot won't be at its rest position at the start of the next episode."
+-            )
++            # No action source, so send nothing and let the motors hold the pose
++            # they were last commanded to. This is the environment-reset window
++            # with teleop disengaged, so the arm stays parked at home.
++            #
++            # The loop must still be paced and `timestamp` still advanced here:
++            # `continue` used to skip both, so `timestamp` stayed at 0 and a
++            # bounded `control_time_s` loop would spin forever at full CPU.
++            if not logged_no_action_source:
++                logged_no_action_source = True
++                logging.info(
++                    "No policy or teleoperator provided; holding the last commanded pose."
++                )
++            if display_data:
++                log_rerun_data(
++                    observation=obs_processed,
++                    compress_images=display_compressed_images,
++                    skip_keys=display_skip_keys,
++                )
++            dt_s = time.perf_counter() - start_loop_t
++            precise_sleep(max(1 / fps - dt_s, 0.0))
++            timestamp = time.perf_counter() - start_episode_t
+             continue
+ 
+         # Applies a pipeline to the action, default is IdentityProcessor
+@@ -403,9 +473,17 @@ def record_loop(
+             frame = {**observation_frame, **action_frame, "task": single_task}
+             dataset.add_frame(frame)
+ 
++            # Raw metric depth for the same observation, kept index-aligned with
++            # the dataset frame just added.
++            if depth_recorder is not None:
++                depth_recorder.add_frame()
++
+         if display_data:
+             log_rerun_data(
+-                observation=obs_processed, action=action_values, compress_images=display_compressed_images
++                observation=obs_processed,
++                action=action_values,
++                compress_images=display_compressed_images,
++                skip_keys=display_skip_keys,
+             )
+ 
+         dt_s = time.perf_counter() - start_loop_t
+@@ -413,10 +491,78 @@ def record_loop(
+ 
+         timestamp = time.perf_counter() - start_episode_t
+ 
++    if show_status:
++        print("\r" + " " * 78 + "\r", end="", flush=True)
++
++
++def wait_for_leader_at_home(
++    teleop: Teleoperator | list[Teleoperator] | None,
++    events: dict,
++    fps: int,
++    tolerance_deg: float = 5.0,
++) -> None:
++    """Hold until the leader is back near home, so every episode starts alike.
++
++    The follower mirrors the leader in absolute joint angles, so parking the
++    follower at home is not enough on its own: the moment teleop re-engages the
++    follower goes wherever the leader is. Blocking here until the leader itself
++    is near home is what actually makes episode frame 0 consistent.
++
++    RIGHT starts anyway, ESC stops the session. A non-positive tolerance skips
++    the check entirely.
++    """
++    if not isinstance(teleop, Teleoperator) or tolerance_deg <= 0:
++        return
++
++    show_status = sys.stdout.isatty()
++    while not events["stop_recording"]:
++        try:
++            action = teleop.get_action()
++        except Exception as e:
++            logging.warning("Could not read the leader pose while waiting for alignment: %s", e)
++            break
++
++        # Home is all-zeros in action space, so each value is its own offset.
++        offsets = {k.removesuffix(".pos"): v for k, v in action.items() if k.endswith(".pos")}
++        off_home = {name: value for name, value in offsets.items() if abs(value) > tolerance_deg}
++        if not off_home:
++            break
++
++        if events["exit_early"]:
++            events["exit_early"] = False
++            logging.info(
++                "Leader alignment overridden; this episode starts %.0f° off home.",
++                max(abs(v) for v in off_home.values()),
++            )
++            break
++
++        if show_status:
++            worst = sorted(off_home.items(), key=lambda kv: -abs(kv[1]))[:3]
++            detail = "  ".join(f"{name} {value:+.0f}°" for name, value in worst)
++            print(
++                f"\r  [ALIGN leader to home ±{tolerance_deg:.0f}°]  {detail}  "
++                "RIGHT=start anyway  ESC=stop   ",
++                end="",
++                flush=True,
++            )
++
++        precise_sleep(1 / max(fps, 1))
++
++    if show_status:
++        print("\r" + " " * 78 + "\r", end="", flush=True)
++
+ 
+ @parser.wrap()
+ def record(cfg: RecordConfig) -> LeRobotDataset:
+     init_logging()
++
++    def _raise_keyboard_interrupt(signum, frame):
++        del frame
++        raise KeyboardInterrupt(f"Received signal {signum}; stopping recording cleanly.")
++
++    signal.signal(signal.SIGTERM, _raise_keyboard_interrupt)
++    signal.signal(signal.SIGINT, _raise_keyboard_interrupt)
++
+     logging.info(pformat(asdict(cfg)))
+     if cfg.display_data:
+         init_rerun(session_name="recording", ip=cfg.display_ip, port=cfg.display_port)
+@@ -448,6 +594,9 @@ def record(cfg: RecordConfig) -> LeRobotDataset:
+ 
+     dataset = None
+     listener = None
++    events = None
++    depth_recorder = None
++    recording_started = False
+ 
+     try:
+         if cfg.resume:
+@@ -501,10 +650,33 @@ def record(cfg: RecordConfig) -> LeRobotDataset:
+ 
+         listener, events = init_keyboard_listener()
+ 
++        # Depth cameras enter the dataset as 8-bit colour maps; this stores the
++        # sensor's uint16 depth losslessly next to it. No-op without depth cameras.
++        depth_recorder = DepthRecorder(dataset.root, getattr(robot, "cameras", {}), cfg.dataset.fps)
++        if depth_recorder.enabled:
++            depth_recorder.write_metadata()
++            logging.info("Recording raw metric depth for: %s", ", ".join(depth_recorder.cameras))
++
++        # Keep the live viewer to the colour cameras. The depth streams shown here
++        # are 8-bit colour-map previews, not the uint16 depth being recorded, and
++        # streaming them doubles the viewer's cost for no extra information.
++        display_skip_keys = tuple(depth_recorder.cameras)
++        if display_skip_keys and cfg.display_data:
++            logging.info("Live viewer showing colour only; hiding %s", ", ".join(display_skip_keys))
++
++        # Park at home before the FIRST episode too. Every later episode is
++        # already homed by the reset phase, so without this only episode 0 would
++        # begin from an arbitrary pose. That matters most for policy rollouts:
++        # the policy was trained on episodes that all start at home, so starting
++        # elsewhere puts it off-distribution from its very first observation.
++        return_robot_to_home(robot, cfg.dataset.fps)
++
+         with VideoEncodingManager(dataset):
+             recorded_episodes = 0
+             while recorded_episodes < cfg.dataset.num_episodes and not events["stop_recording"]:
++                recording_started = True
+                 log_say(f"Recording episode {dataset.num_episodes}", cfg.play_sounds)
++                depth_recorder.start_episode(dataset.num_episodes)
+                 record_loop(
+                     robot=robot,
+                     events=events,
+@@ -521,19 +693,69 @@ def record(cfg: RecordConfig) -> LeRobotDataset:
+                     single_task=cfg.dataset.single_task,
+                     display_data=cfg.display_data,
+                     display_compressed_images=display_compressed_images,
++                    status_label=(
++                        f"[REC episode {dataset.num_episodes}]  RIGHT=save  LEFT=redo  ESC=stop "
++                    ),
++                    depth_recorder=depth_recorder,
++                    display_skip_keys=display_skip_keys,
++                    engage_ramp_s=cfg.dataset.engage_ramp_s,
+                 )
+ 
+-                # Execute a few seconds without recording to give time to manually reset the environment
+-                # Skip reset for the last episode to be recorded
+-                if not events["stop_recording"] and (
+-                    (recorded_episodes < cfg.dataset.num_episodes - 1) or events["rerecord_episode"]
+-                ):
++                if events["rerecord_episode"]:
++                    log_say("Re-record episode", cfg.play_sounds)
++                    events["rerecord_episode"] = False
++                    events["save_episode"] = False
++                    events["exit_early"] = False
++                    dataset.clear_episode_buffer()
++                    depth_recorder.discard_episode()
++
++                    # Same treatment as a saved episode: park the follower at
++                    # home and give the operator a real window to reset the
++                    # scene before the retry starts.
++                    return_robot_to_home(robot, cfg.dataset.fps)
++                    record_loop(
++                        robot=robot,
++                        events=events,
++                        fps=cfg.dataset.fps,
++                        teleop_action_processor=teleop_action_processor,
++                        robot_action_processor=robot_action_processor,
++                        robot_observation_processor=robot_observation_processor,
++                        teleop=None,
++                        control_time_s=cfg.dataset.discard_reset_time_s,
++                        single_task=cfg.dataset.single_task,
++                        display_data=cfg.display_data,
++                        status_label=(
++                            f"[DISCARDED — redoing episode {dataset.num_episodes}]  "
++                            "arm parked at home  RIGHT=start now  ESC=stop "
++                        ),
++                        display_skip_keys=display_skip_keys,
++                    )
++                    events["exit_early"] = False
++                    continue
++
++                if events["stop_recording"]:
++                    dataset.clear_episode_buffer()
++                    depth_recorder.discard_episode()
++                    break
++
++                dataset.save_episode()
++                depth_recorder.save_episode()
++                recorded_episodes += 1
++                events["save_episode"] = False
++
++                # Give the operator time to reset only after the episode is safely saved.
++                if recorded_episodes < cfg.dataset.num_episodes:
+                     log_say("Reset the environment", cfg.play_sounds)
+ 
+-                    # reset g1 robot
+                     if robot.name == "unitree_g1":
+                         robot.reset()
+ 
++                    # Park the follower at home so every episode starts from the
++                    # same pose. Teleop is left disengaged for the reset window
++                    # below, otherwise the very next control tick would mirror
++                    # the leader and undo this immediately.
++                    return_robot_to_home(robot, cfg.dataset.fps)
++
+                     record_loop(
+                         robot=robot,
+                         events=events,
+@@ -541,35 +763,97 @@ def record(cfg: RecordConfig) -> LeRobotDataset:
+                         teleop_action_processor=teleop_action_processor,
+                         robot_action_processor=robot_action_processor,
+                         robot_observation_processor=robot_observation_processor,
+-                        teleop=teleop,
++                        teleop=None,
+                         control_time_s=cfg.dataset.reset_time_s,
+                         single_task=cfg.dataset.single_task,
+                         display_data=cfg.display_data,
++                        status_label=(
++                            f"[RESET env — saved {recorded_episodes}/{cfg.dataset.num_episodes}]  "
++                            "arm parked at home, teleop off  RIGHT=start now  ESC=stop "
++                        ),
++                        display_skip_keys=display_skip_keys,
+                     )
+-
+-                if events["rerecord_episode"]:
+-                    log_say("Re-record episode", cfg.play_sounds)
++                    events["save_episode"] = False
+                     events["rerecord_episode"] = False
+-                    events["exit_early"] = False
+-                    dataset.clear_episode_buffer()
+-                    continue
+ 
+-                dataset.save_episode()
+-                recorded_episodes += 1
++                    # The follower stays parked at home here on purpose. Closing
++                    # the gap to the leader is done by `engage_ramp_s` inside the
++                    # next episode, so frame 0 is always this same home pose.
++                    wait_for_leader_at_home(
++                        teleop=teleop,
++                        events=events,
++                        fps=cfg.dataset.fps,
++                        tolerance_deg=cfg.leader_home_tolerance_deg,
++                    )
+     finally:
++        # Once shutdown begins, do not let repeated Ctrl-C/SIGTERM interrupt
++        # homing or torque disable halfway through.
++        signal.signal(signal.SIGINT, signal.SIG_IGN)
++        signal.signal(signal.SIGTERM, signal.SIG_IGN)
+         log_say("Stop recording", cfg.play_sounds, blocking=True)
+ 
+-        if dataset:
+-            dataset.finalize()
+-
++        # Make the hardware safe before potentially slow video/dataset finalization.
+         if robot.is_connected:
+-            robot.disconnect()
++            try:
++                if recording_started:
++                    return_robot_to_home(robot, cfg.dataset.fps)
++                else:
++                    logging.info("Skipping return-to-home because recording did not start.")
++            except Exception as e:
++                logging.warning("Failed to return robot to home position before disconnect: %s", e)
++            finally:
++                try:
++                    robot.disconnect()
++                except Exception as e:
++                    logging.warning("Failed to fully disconnect robot during shutdown: %s", e)
++                    for motor_name, motor in getattr(robot, "motors", {}).items():
++                        try:
++                            motor.disable()
++                        except Exception as motor_error:
++                            logging.warning("Failed to disable motor %s: %s", motor_name, motor_error)
++                        try:
++                            motor.close()
++                        except Exception as motor_error:
++                            logging.warning("Failed to close motor %s: %s", motor_name, motor_error)
++                    bus = getattr(robot, "bus", None)
++                    if bus is not None:
++                        try:
++                            bus.close()
++                        except Exception as bus_error:
++                            logging.warning("Failed to close robot bus: %s", bus_error)
++                    for camera in getattr(robot, "cameras", {}).values():
++                        if camera.is_connected:
++                            try:
++                                camera.disconnect()
++                            except Exception as camera_error:
++                                logging.warning(
++                                    "Failed to disconnect camera during shutdown: %s", camera_error
++                                )
+         if teleop and teleop.is_connected:
+-            teleop.disconnect()
++            try:
++                teleop.disconnect()
++            except Exception as e:
++                logging.warning("Failed to fully disconnect teleoperator during shutdown: %s", e)
+ 
+-        if not is_headless() and listener:
++        if events:
++            events["stop_recording"] = True
++
++        if listener:
+             listener.stop()
+ 
++        # Drop any depth frames from an episode that was never saved.
++        if depth_recorder is not None:
++            try:
++                depth_recorder.close()
++            except Exception as e:
++                logging.warning("Failed to close the depth recorder during shutdown: %s", e)
++
++        if dataset:
++            try:
++                dataset.finalize()
++            except Exception as e:
++                logging.warning("Failed to finalize dataset during shutdown: %s", e)
++
+         if cfg.dataset.push_to_hub:
+             dataset.push_to_hub(tags=cfg.dataset.tags, private=cfg.dataset.private)
+ 
+diff --git a/src/lerobot/utils/control_utils.py b/src/lerobot/utils/control_utils.py
+index 7cfe177..0551cfc 100644
+--- a/src/lerobot/utils/control_utils.py
++++ b/src/lerobot/utils/control_utils.py
+@@ -18,7 +18,13 @@
+ 
+ 
+ import logging
++import os
++import select
++import sys
++import termios
++import threading
+ import traceback
++import tty
+ from contextlib import nullcontext
+ from copy import copy
+ from functools import cache
+@@ -119,7 +125,7 @@ def init_keyboard_listener():
+     """
+     Initializes a non-blocking keyboard listener for real-time user interaction.
+ 
+-    This function sets up a listener for specific keys (right arrow, left arrow, escape) to control
++    This function sets up a listener for specific keys (right arrow/enter, left arrow, escape) to control
+     the program flow during execution, such as stopping recording or exiting loops. It gracefully
+     handles headless environments where keyboard listening is not possible.
+ 
+@@ -133,9 +139,74 @@ def init_keyboard_listener():
+     # to allow your terminal to monitor keyboard events.
+     events = {}
+     events["exit_early"] = False
++    events["save_episode"] = False
+     events["rerecord_episode"] = False
+     events["stop_recording"] = False
+ 
++    class StdinKeyListener:
++        def __init__(self):
++            self.thread = threading.Thread(
++                target=self._listen,
++                name="stdin_key_listener",
++                daemon=True,
++            )
++
++        def start(self):
++            self.thread.start()
++
++        def stop(self):
++            events["stop_recording"] = True
++            self.thread.join(timeout=1.0)
++
++        def _listen(self):
++            listen_for_stdin_keys()
++
++    def listen_for_stdin_keys():
++        fd = sys.stdin.fileno()
++        old_settings = termios.tcgetattr(fd)
++        tty.setcbreak(fd)
++        try:
++            while not events["stop_recording"]:
++                readable, _, _ = select.select([sys.stdin], [], [], 0.1)
++                if not readable:
++                    continue
++
++                char = os.read(fd, 1)
++                if not char:
++                    break
++
++                if char in (b"\n", b"\r"):
++                    print("Enter pressed. Saving episode...")
++                    events["save_episode"] = True
++                    events["exit_early"] = True
++                elif char == b"\x1b":
++                    sequence = char
++                    while len(sequence) < 3:
++                        readable, _, _ = select.select([fd], [], [], 0.1)
++                        if not readable:
++                            break
++                        sequence += os.read(fd, 1)
++
++                    if sequence == b"\x1b[C":
++                        print("Right arrow pressed. Saving episode...")
++                        events["save_episode"] = True
++                        events["exit_early"] = True
++                    elif sequence == b"\x1b[D":
++                        print("Left arrow pressed. Discarding and re-recording episode...")
++                        events["rerecord_episode"] = True
++                        events["exit_early"] = True
++                    elif sequence == b"\x1b":
++                        print("Escape pressed. Stopping data recording...")
++                        events["stop_recording"] = True
++                        events["exit_early"] = True
++        finally:
++            termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
++
++    if sys.stdin.isatty():
++        listener = StdinKeyListener()
++        listener.start()
++        return listener, events
++
+     if is_headless():
+         logging.warning(
+             "Headless environment detected. On-screen cameras display and keyboard inputs will not be available."
+@@ -148,11 +219,12 @@ def init_keyboard_listener():
+ 
+     def on_press(key):
+         try:
+-            if key == keyboard.Key.right:
+-                print("Right arrow key pressed. Exiting loop...")
++            if key in (keyboard.Key.right, keyboard.Key.enter):
++                print("Right arrow/Enter pressed. Saving episode...")
++                events["save_episode"] = True
+                 events["exit_early"] = True
+             elif key == keyboard.Key.left:
+-                print("Left arrow key pressed. Exiting loop and rerecord the last episode...")
++                print("Left arrow pressed. Discarding and re-recording episode...")
+                 events["rerecord_episode"] = True
+                 events["exit_early"] = True
+             elif key == keyboard.Key.esc:
+diff --git a/src/lerobot/utils/robot_utils.py b/src/lerobot/utils/robot_utils.py
+index 28c8e7c..e0e5c8e 100644
+--- a/src/lerobot/utils/robot_utils.py
++++ b/src/lerobot/utils/robot_utils.py
+@@ -12,8 +12,14 @@
+ # See the License for the specific language governing permissions and
+ # limitations under the License.
+ 
++import logging
++import math
+ import platform
+ import time
++from typing import TYPE_CHECKING
++
++if TYPE_CHECKING:  # avoid importing the robots package at runtime
++    from lerobot.robots import Robot
+ 
+ 
+ def precise_sleep(seconds: float, spin_threshold: float = 0.010, sleep_margin: float = 0.003):
+@@ -53,3 +59,107 @@ def precise_sleep(seconds: float, spin_threshold: float = 0.010, sleep_margin: f
+     else:
+         # On Linux time.sleep is accurate enough for most uses
+         time.sleep(seconds)
++
++
++def _read_robot_action_pose(robot: "Robot") -> dict[str, float] | None:
++    """Read the robot's current pose expressed in action space.
++
++    `send_action` applies `joint_directions` on the way out, so the raw motor
++    feedback is divided by it here to give a value that can be fed straight back
++    in as an action. Returns None if the pose could not be read.
++    """
++    keys = [key for key in robot.action_features if key.endswith(".pos")]
++    if not keys:
++        return None
++
++    directions = getattr(robot.config, "joint_directions", {})
++    try:
++        pose = {}
++        if hasattr(robot, "motors") and hasattr(robot, "bus"):
++            for motor in robot.motors.values():
++                motor.request_feedback()
++            robot.bus.poll_feedback_once()
++            stale = []
++            for key in keys:
++                motor_name = key.removesuffix(".pos")
++                state = robot.motors[motor_name].get_state()
++                if state is None:
++                    # Never substitute 0.0 here. 0.0 IS the home pose, so a failed
++                    # read would look like "already home" and collapse the ramp
++                    # into a single full-travel step command.
++                    stale.append(motor_name)
++                    continue
++                pose[key] = math.degrees(state.pos) / (directions.get(motor_name, 1.0) or 1.0)
++            if stale:
++                logging.warning(
++                    "No CAN feedback from %s; falling back to get_observation().", ", ".join(stale)
++                )
++                pose = {}
++                observation = robot.get_observation()
++                for key in keys:
++                    motor_name = key.removesuffix(".pos")
++                    if key not in observation:
++                        logging.error("Joint %s missing from observation; cannot read pose.", key)
++                        return None
++                    pose[key] = float(observation[key]) / (directions.get(motor_name, 1.0) or 1.0)
++        else:
++            observation = robot.get_observation()
++            for key in keys:
++                motor_name = key.removesuffix(".pos")
++                pose[key] = float(observation.get(key, 0.0)) / (directions.get(motor_name, 1.0) or 1.0)
++    except Exception as e:
++        logging.warning("Could not read the current robot pose: %s", e)
++        return None
++
++    return pose
++
++
++def ramp_robot_to_action(
++    robot: "Robot",
++    target_action: dict[str, float],
++    fps: int,
++    duration_s: float = 3.0,
++    label: str = "target pose",
++) -> None:
++    """Interpolate the robot from its current pose to `target_action`."""
++    if not robot.is_connected or not target_action:
++        return
++
++    start_action = _read_robot_action_pose(robot)
++    if start_action is None:
++        # Commanding the target from an unknown pose is a blind full-travel step:
++        # worse than not moving. Refuse loudly instead.
++        logging.error(
++            "Cannot read the current pose, so moving to the %s would be an abrupt "
++            "uncontrolled jump. REFUSING to move; the arm has NOT been homed.",
++            label,
++        )
++        return
++
++    steps = max(1, int(max(duration_s, 0.0) * max(fps, 1)))
++    logging.info("Moving robot to %s over %.1f seconds.", label, duration_s)
++    for step in range(1, steps + 1):
++        alpha = step / steps
++        action = {
++            key: start_action.get(key, value) + (value - start_action.get(key, value)) * alpha
++            for key, value in target_action.items()
++        }
++        robot.send_action(action)
++        precise_sleep(1 / max(fps, 1))
++
++
++def return_robot_to_home(robot: "Robot", fps: int, duration_s: float = 3.0) -> None:
++    if not robot.is_connected:
++        # Callers rely on this to guarantee a known start pose, so a skip has to
++        # be loud. `is_connected` also covers the cameras on some robots, so a
++        # dropped camera can land here with the motors perfectly fine.
++        logging.warning(
++            "Robot reports not connected; SKIPPING return-to-home. The arm is wherever it was left."
++        )
++        return
++
++    home_action = {key: 0.0 for key in robot.action_features if key.endswith(".pos")}
++    if not home_action:
++        logging.warning("Robot exposes no '.pos' action features; SKIPPING return-to-home.")
++        return
++    ramp_robot_to_action(robot, home_action, fps, duration_s, label="home position")
+diff --git a/src/lerobot/utils/visualization_utils.py b/src/lerobot/utils/visualization_utils.py
+index 31ca8d2..1538810 100644
+--- a/src/lerobot/utils/visualization_utils.py
++++ b/src/lerobot/utils/visualization_utils.py
+@@ -54,6 +54,7 @@ def log_rerun_data(
+     observation: RobotObservation | None = None,
+     action: RobotAction | None = None,
+     compress_images: bool = False,
++    skip_keys: tuple[str, ...] = (),
+ ) -> None:
+     """
+     Logs observation and action data to Rerun for real-time visualization.
+@@ -72,10 +73,13 @@ def log_rerun_data(
+         observation: An optional dictionary containing observation data to log.
+         action: An optional dictionary containing action data to log.
+         compress_images: Whether to compress images before logging to save bandwidth & memory in exchange for cpu and quality.
++        skip_keys: Observation keys to leave out of the viewer. Streaming every
++            camera is expensive at high fps, and the depth colour maps in
++            particular are previews rather than the data being recorded.
+     """
+     if observation:
+         for k, v in observation.items():
+-            if v is None:
++            if v is None or k in skip_keys:
+                 continue
+             key = k if str(k).startswith(OBS_PREFIX) else f"{OBS_STR}.{k}"
+ 

@@ -1,0 +1,27 @@
+# --- Cloned upstream repos (tracked in their own git) ---
+rebot_lerobot/
+reBotArm_control_py/
+
+# --- Data and model artifacts (large, not source) ---
+datasets/
+rebot_b601_rs_vla/
+inference/pi05_brown_sugar_*/
+outputs/
+logs/
+Log/
+
+# --- Caches / build products ---
+.inductor_cache/
+__pycache__/
+*.pyc
+*.bak
+
+# --- Editor / agent scratch ---
+.agents/
+.codex/
+
+# --- Third-party GPL kernel driver source + build artifacts (not our work) ---
+peak_usb_build/
+
+# --- Agent/editor config (local paths, not part of the pipeline) ---
+.claude/
