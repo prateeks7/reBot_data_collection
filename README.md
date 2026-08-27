@@ -21,7 +21,20 @@ RealSense D435i overhead, both 640x480 @ 30 fps over USB 3.2. Leader arm on
 | `merge_rebot_datasets.py` | Merge several recorded datasets into one. |
 | `preview_pi05_input.py` | Render what a pi0.5 policy actually sees for a given frame. |
 | `run_lerobot_auto_can.sh`, `helpful_docs/` | CAN debugging notes and helpers. |
+| `calibration/` | Leader and follower calibration files, plus what they do and do not contain. |
 | `lerobot_patches/` | Our changes to the LeRobot fork (see below). |
+
+## Calibration
+
+```bash
+cp -r calibration/robots         ~/.cache/huggingface/lerobot/calibration/
+cp -r calibration/teleoperators  ~/.cache/huggingface/lerobot/calibration/
+```
+
+Note these do **not** carry the arm's zero position — that lives in each
+RobStride motor's non-volatile memory, written by `set_zero_position()`. The
+committed files hold placeholder ranges only, so LeRobot does not prompt for a
+fresh calibration on connect. See `calibration/README.md`.
 
 ## Recording
 
