@@ -12,6 +12,8 @@ RealSense D435i overhead, both 640x480 @ 30 fps over USB 3.2. Leader arm on
 | Path | What it is |
 |---|---|
 | `record_rebot_vla.sh` | The data-collection launcher. CAN bring-up, camera validation, resumable recording. |
+| `inference/fetch_checkpoint.py` | Download a pi0.5 checkpoint and apply the config fixes it needs to run. |
+| `inference/run_inference.sh` | Run a checkpoint on the arm, sync (records) or async (does not). |
 | `inference/go_home.py` | Standalone motor fault check + verified ramp to home. |
 | `inference/start_async_server.sh` | Homes the arm, gates on motor health, starts the async policy server. |
 | `push_to_hub.py` | Push a finished dataset (including the depth sidecar) to the Hugging Face Hub. |
@@ -55,6 +57,38 @@ just between saved episodes.
 
 `--leader-home-tolerance D` optionally holds until the leader itself is within
 D degrees of home before starting (0 = off, the default).
+
+## Inference
+
+```bash
+# Fetch a checkpoint (applies the compile_model / gradient_checkpointing fixes)
+python inference/fetch_checkpoint.py 40k
+
+# Sync: drives the arm AND records an eval dataset
+inference/run_inference.sh --checkpoint 40k
+
+# Async: policy server in one terminal, client in another. Records NOTHING.
+inference/start_async_server.sh
+inference/run_inference.sh --checkpoint 40k --mode async
+```
+
+Only `wrist` and `overhead` RGB are opened -- those are the policy's actual
+inputs. The depth streams are recorded during collection but are not policy
+inputs, and pi0.5 pads the third camera slot itself (`empty_cameras: 1`).
+
+Two settings matter and are easy to get wrong:
+
+- **`max_relative_target`** defaults to `None` on this robot, which skips
+  `ensure_safe_goal_position` entirely, so a policy action is commanded at full
+  travel in one tick. `run_inference.sh` sets it to `5.0` degrees per step.
+- **`compile_model`** is left `True` in the checkpoint config because the async
+  policy server calls `from_pretrained(path)` with no override hook. Sync passes
+  `--policy.compile_model=false` so short runs skip the `max-autotune` compile.
+  Set `TORCHINDUCTOR_CACHE_DIR` to something persistent (`start_async_server.sh`
+  does) or the compile is re-paid on every reboot.
+
+The async client has **no dataset support at all** -- `RobotClientConfig` has no
+repo, root, or record field. Use sync if you want the rollouts saved.
 
 ## Depth
 
